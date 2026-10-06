@@ -521,8 +521,168 @@ async def self_improve(ctx: Context, force: bool = False) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Discovery endpoints (A2A AgentCard, x402 Bazaar, MCP server-card)
+# ---------------------------------------------------------------------------
+
+AGENT_CARD = {
+    "name": "x402-exchange",
+    "description": (
+        "Autonomous AI agent serving Qwen3-8B inference for $0.01 USDC per request "
+        "via the x402 payment protocol. Self-improving through LoRA fine-tuning "
+        "funded by earned revenue. No API keys, no subscriptions -- just pay and use."
+    ),
+    "provider": {
+        "organization": "x402-exchange",
+        "url": "https://github.com/salus-ryan/x402",
+    },
+    "url": "http://localhost:4022/mcp",
+    "supportedInterfaces": [
+        {
+            "url": "http://localhost:4022/mcp",
+            "protocolBinding": "MCP",
+            "protocolVersion": "2025-03-26",
+        }
+    ],
+    "capabilities": {
+        "streaming": False,
+        "pushNotifications": False,
+    },
+    "skills": [
+        {
+            "id": "inference",
+            "name": "Qwen3-8B Inference",
+            "description": (
+                "Chat completions via Qwen3-8B hosted on Modal (L4 GPU). "
+                "$0.01 USDC per request on Base Sepolia. Supports system/user/assistant "
+                "messages, configurable temperature and max_tokens."
+            ),
+            "inputModes": ["application/json"],
+            "outputModes": ["application/json"],
+        },
+        {
+            "id": "status",
+            "name": "Entity P&L Report",
+            "description": (
+                "Free real-time report of the entity's financial state: "
+                "USDC revenue, Modal compute costs, net position, and "
+                "self-improvement capacity."
+            ),
+            "inputModes": ["application/json"],
+            "outputModes": ["application/json"],
+        },
+    ],
+    "security": [],
+    "x402": {
+        "network": NETWORK,
+        "payTo": SELLER_ADDRESS,
+        "facilitator": FACILITATOR_URL,
+        "pricing": {
+            "inference": {"amount": "10000", "asset": "USDC", "scheme": "exact"},
+            "ping": {"amount": "10000", "asset": "USDC", "scheme": "exact"},
+        },
+    },
+}
+
+X402_DISCOVERY = {
+    "x402Version": 2,
+    "description": (
+        "x402-exchange: autonomous Qwen3-8B inference agent. "
+        "Pay $0.01 USDC per request. Self-improving via LoRA fine-tuning."
+    ),
+    "endpoints": [
+        {
+            "url": "http://localhost:4022/mcp",
+            "transport": "mcp",
+            "tools": ["inference", "ping", "health", "status", "self_improve"],
+            "pricing": {
+                "inference": "$0.01 USDC",
+                "ping": "$0.01 USDC",
+                "health": "free",
+                "status": "free",
+                "self_improve": "free",
+            },
+        },
+    ],
+    "network": NETWORK,
+    "payTo": SELLER_ADDRESS,
+    "facilitator": FACILITATOR_URL,
+    "model": "Qwen/Qwen3-8B",
+    "exchange": EXCHANGE_URL,
+}
+
+MCP_SERVER_CARD = {
+    "serverInfo": {
+        "name": "x402-exchange",
+        "version": "0.2.0",
+        "description": (
+            "Autonomous Qwen3-8B inference behind x402 USDC payments. "
+            "5 tools: inference ($0.01), ping ($0.01), health (free), "
+            "status (free P&L), self_improve (free)."
+        ),
+    },
+    "capabilities": {"tools": True, "prompts": False, "resources": False},
+    "url": "http://localhost:4022/mcp",
+    "transport": "streamable-http",
+}
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
+
+def _update_urls(host: str, port: int):
+    """Update discovery documents with actual host:port."""
+    base = f"http://{host}:{port}" if host != "0.0.0.0" else f"http://localhost:{port}"
+    AGENT_CARD["url"] = f"{base}/mcp"
+    AGENT_CARD["supportedInterfaces"][0]["url"] = f"{base}/mcp"
+    X402_DISCOVERY["endpoints"][0]["url"] = f"{base}/mcp"
+    MCP_SERVER_CARD["url"] = f"{base}/mcp"
+
+
+async def _run_with_discovery(host: str, port: int):
+    """Run MCP server with discovery endpoints via ASGI middleware."""
+    import uvicorn
+
+    _update_urls(host, port)
+
+    # Get the MCP Starlette app (includes lifespan)
+    mcp_app = mcp.streamable_http_app(
+        streamable_http_path="/mcp",
+        stateless_http=True,
+        host=host,
+    )
+
+    # ASGI middleware that intercepts discovery paths before MCP
+    discovery_paths = {
+        "/": lambda: {"name": "x402-exchange", "description": "Autonomous Qwen3-8B inference agent. Pay USDC, get intelligence.", "mcp": f"http://localhost:{port}/mcp", "discovery": {"agent_card": "/.well-known/agent-card.json", "x402": "/.well-known/x402-discovery", "mcp_server_card": "/.well-known/mcp/server-card.json"}},
+        "/.well-known/agent-card.json": lambda: AGENT_CARD,
+        "/.well-known/agent.json": lambda: AGENT_CARD,
+        "/.well-known/x402-discovery": lambda: X402_DISCOVERY,
+        "/.well-known/mcp/server-card.json": lambda: MCP_SERVER_CARD,
+    }
+
+    async def app(scope, receive, send):
+        if scope["type"] == "http" and scope["method"] == "GET":
+            path = scope["path"]
+            if path in discovery_paths:
+                body = json.dumps(discovery_paths[path]()).encode()
+                await send({
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        [b"content-type", b"application/json"],
+                        [b"content-length", str(len(body)).encode()],
+                        [b"access-control-allow-origin", b"*"],
+                    ],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
+        await mcp_app(scope, receive, send)
+
+    config = uvicorn.Config(app, host=host, port=port)
+    server = uvicorn.Server(config)
+    await server.serve()
+
 
 def main():
     transport = sys.argv[1] if len(sys.argv) > 1 else "streamable-http"
@@ -530,13 +690,7 @@ def main():
     if transport == "stdio":
         asyncio.run(mcp.run_stdio_async())
     elif transport == "streamable-http":
-        asyncio.run(
-            mcp.run_streamable_http_async(
-                host="0.0.0.0",
-                port=4022,
-                stateless_http=True,
-            )
-        )
+        asyncio.run(_run_with_discovery("0.0.0.0", 4022))
     else:
         print(f"Unknown transport: {transport}. Use 'stdio' or 'streamable-http'.")
         sys.exit(1)
