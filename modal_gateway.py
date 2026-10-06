@@ -350,8 +350,37 @@ async def health(request):
 
 # ── MCP server (inline, stateless) ──────────────────────────────────────
 
+from typing import Annotated
+from pydantic import BaseModel, Field as PydanticField
+
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
+
+
+class InferenceResult(BaseModel):
+    """Result of a paid Qwen3-8B inference request."""
+    response: str = PydanticField(description="The model's generated text response")
+    model: str = PydanticField(description="Model identifier used for generation")
+    usage: dict = PydanticField(default_factory=dict, description="Token usage statistics (prompt_tokens, completion_tokens, total_tokens)")
+    paid: bool = PydanticField(description="Whether the request was paid for via x402")
+    settlement_tx: str = PydanticField(description="On-chain settlement transaction hash on Base Sepolia")
+
+
+class HealthResult(BaseModel):
+    """Health check response for the x402 exchange."""
+    status: str = PydanticField(description="Service status, 'ok' when healthy")
+    model: str = PydanticField(description="Currently deployed model identifier")
+    usdc_balance: str = PydanticField(description="On-chain USDC balance in human-readable format (e.g. '$0.03')")
+    network: str = PydanticField(description="EVM network identifier (e.g. 'eip155:84532' for Base Sepolia)")
+
+
+class StatusResult(BaseModel):
+    """P&L status report for the x402 exchange entity."""
+    entity: str = PydanticField(description="Entity name identifier")
+    model: str = PydanticField(description="Currently deployed model identifier")
+    usdc_balance: str = PydanticField(description="On-chain USDC balance in human-readable format")
+    usdc_atomic: int = PydanticField(description="On-chain USDC balance in atomic units (6 decimals)")
+    network: str = PydanticField(description="EVM network identifier")
 
 mcp = MCPServer(
     name="x402-exchange",
@@ -384,11 +413,11 @@ mcp = MCPServer(
 )
 async def mcp_inference(
     ctx: Context,
-    prompt: str = "",
-    messages: list = None,
-    max_tokens: int = 256,
-    temperature: float = 0.7,
-) -> CallToolResult:
+    prompt: Annotated[str, PydanticField(description="A single user message to send to Qwen3-8B. Use this for simple single-turn queries.")] = "",
+    messages: Annotated[list | None, PydanticField(description="Full conversation history as a list of {role, content} dicts for multi-turn chat. Overrides prompt if both provided.")] = None,
+    max_tokens: Annotated[int, PydanticField(description="Maximum number of tokens to generate in the response. Range: 1-8192.")] = 256,
+    temperature: Annotated[float, PydanticField(description="Sampling temperature controlling randomness. 0.0 = deterministic, 1.0 = creative. Range: 0.0-2.0.")] = 0.7,
+) -> Annotated[CallToolResult, InferenceResult]:
     meta = None
     try:
         meta = ctx.request_context.meta
@@ -448,8 +477,10 @@ async def mcp_inference(
         result = resp.json()
 
     content = result["choices"][0]["message"]["content"]
+    result_data = {"response": content, "model": "Qwen/Qwen3-8B", "usage": result.get("usage", {}), "paid": True, "settlement_tx": sr.transaction}
     return CallToolResult(
-        content=[TextContent(type="text", text=json.dumps({"response": content, "model": "Qwen/Qwen3-8B", "usage": result.get("usage", {}), "paid": True, "settlement_tx": sr.transaction}))],
+        content=[TextContent(type="text", text=json.dumps(result_data))],
+        structured_content=result_data,
         meta={"x402/payment-response": sr.model_dump(by_alias=True, exclude_none=True)},
         is_error=False,
     )
@@ -471,9 +502,9 @@ async def mcp_inference(
         openWorldHint=True,
     ),
 )
-async def mcp_health() -> str:
+async def mcp_health() -> HealthResult:
     atomic, human = get_usdc_balance()
-    return json.dumps({"status": "ok", "model": "Qwen/Qwen3-8B", "usdc_balance": human, "network": NETWORK})
+    return HealthResult(status="ok", model="Qwen/Qwen3-8B", usdc_balance=human, network=NETWORK)
 
 
 @mcp.tool(
@@ -493,9 +524,9 @@ async def mcp_health() -> str:
         openWorldHint=True,
     ),
 )
-async def mcp_status() -> str:
+async def mcp_status() -> StatusResult:
     atomic, human = get_usdc_balance()
-    return json.dumps({"entity": "x402-exchange", "model": "Qwen/Qwen3-8B", "usdc_balance": human, "usdc_atomic": atomic, "network": NETWORK})
+    return StatusResult(entity="x402-exchange", model="Qwen/Qwen3-8B", usdc_balance=human, usdc_atomic=atomic, network=NETWORK)
 
 
 # ── Prompts (for Smithery quality score + user guidance) ──────────────────
