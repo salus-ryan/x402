@@ -284,12 +284,20 @@ async def inference_endpoint(request):
     max_tokens = body.get("max_tokens", 256)
     temperature = body.get("temperature", 0.7)
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            f"{EXCHANGE_URL}/v1/chat/completions",
-            json={"model": "Qwen/Qwen3-8B", "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
-        )
-        resp.raise_for_status()
+    import asyncio as _aio
+    async with httpx.AsyncClient(timeout=180) as client:
+        for attempt in range(4):
+            resp = await client.post(
+                f"{EXCHANGE_URL}/v1/chat/completions",
+                json={"model": "Qwen/Qwen3-8B", "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
+            )
+            if resp.status_code == 503:
+                await _aio.sleep(min(15 * (attempt + 1), 45))
+                continue
+            resp.raise_for_status()
+            break
+        else:
+            return JSONResponse({"error": "Brain cold-starting. Try again in ~60s.", "paid": True, "settlement_tx": settle_result.transaction}, status_code=503)
         result = resp.json()
 
     content = result["choices"][0]["message"]["content"]
@@ -468,12 +476,26 @@ async def mcp_inference(
     if not messages:
         messages = [{"role": "user", "content": "Hello"}]
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            f"{EXCHANGE_URL}/v1/chat/completions",
-            json={"model": "Qwen/Qwen3-8B", "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
-        )
-        resp.raise_for_status()
+    # Retry with backoff -- the brain (vLLM on L4) may need 60-90s cold start
+    import asyncio as _aio
+    last_err = None
+    async with httpx.AsyncClient(timeout=180) as client:
+        for attempt in range(4):
+            resp = await client.post(
+                f"{EXCHANGE_URL}/v1/chat/completions",
+                json={"model": "Qwen/Qwen3-8B", "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
+            )
+            if resp.status_code == 503:
+                last_err = f"Brain cold-starting (attempt {attempt + 1}/4)"
+                await _aio.sleep(min(15 * (attempt + 1), 45))
+                continue
+            resp.raise_for_status()
+            break
+        else:
+            return CallToolResult(
+                content=[TextContent(type="text", text=json.dumps({"error": "Brain unavailable after retries. It may be cold-starting (~70s). Try again in a minute.", "paid": True, "settlement_tx": sr.transaction}))],
+                is_error=True,
+            )
         result = resp.json()
 
     content = result["choices"][0]["message"]["content"]
@@ -504,7 +526,7 @@ async def mcp_inference(
 )
 async def mcp_health() -> HealthResult:
     atomic, human = get_usdc_balance()
-    return HealthResult(status="ok", model="Qwen/Qwen3-8B", usdc_balance=human, network=NETWORK)
+    return HealthResult(status="ok", model="Qwen/Qwen3-8B", usdc_balance=f"${human:.2f}", network=NETWORK)
 
 
 @mcp.tool(
@@ -526,7 +548,7 @@ async def mcp_health() -> HealthResult:
 )
 async def mcp_status() -> StatusResult:
     atomic, human = get_usdc_balance()
-    return StatusResult(entity="x402-exchange", model="Qwen/Qwen3-8B", usdc_balance=human, usdc_atomic=atomic, network=NETWORK)
+    return StatusResult(entity="x402-exchange", model="Qwen/Qwen3-8B", usdc_balance=f"${human:.2f}", usdc_atomic=atomic, network=NETWORK)
 
 
 # ── Prompts (for Smithery quality score + user guidance) ──────────────────

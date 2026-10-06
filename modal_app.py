@@ -32,7 +32,7 @@ MODEL_REVISION = "b968826d9c46dd6066d109eabc6255188de91218"
 
 GPU = "L4"  # 24GB VRAM, $0.80/hr -- fits Qwen3-8B in bf16
 PORT = 8000
-REGION = "us-east"
+REGION = "us"  # any US region for better GPU availability
 MIN_CONTAINERS = 0  # scale to zero when idle; set to 1 for always-warm
 
 # ── Image ────────────────────────────────────────────────────────────────────
@@ -115,7 +115,6 @@ app = modal.App(name=APP_NAME)
     startup_timeout=10 * MINUTES,
     scaledown_window=5 * MINUTES,
     port=PORT,
-    routing_region=REGION,
     target_concurrency=20,
     unauthenticated=True,  # x402 handles auth via payment, not Modal auth
 )
