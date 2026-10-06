@@ -351,16 +351,44 @@ async def health(request):
 # ── MCP server (inline, stateless) ──────────────────────────────────────
 
 from mcp.server.mcpserver import Context, MCPServer
-from mcp.types import CallToolResult, TextContent
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 
 mcp = MCPServer(
     name="x402-exchange",
-    instructions="Pay $0.01 USDC per inference request. Call tools without payment to see pricing.",
+    instructions=(
+        "x402-exchange is an autonomous Qwen3-8B inference agent that accepts "
+        "USDC payments via the x402 protocol. Call any paid tool without payment "
+        "to receive pricing. Sign an EIP-3009 authorization and retry with "
+        "_meta['x402/payment'] to complete the transaction. Free tools (health, "
+        "status) require no payment."
+    ),
 )
 
 
-@mcp.tool(name="inference", description="Qwen3-8B inference. $0.01 USDC per request.")
-async def mcp_inference(ctx: Context, prompt: str = "", messages: list = None, max_tokens: int = 256, temperature: float = 0.7) -> CallToolResult:
+@mcp.tool(
+    name="inference",
+    title="Qwen3-8B Inference",
+    description=(
+        "Generate chat completions using Qwen3-8B hosted on Modal. "
+        "Costs $0.01 USDC per request on Base Sepolia. Supports multi-turn "
+        "conversations, configurable temperature and token limits. "
+        "Call without payment to receive pricing details."
+    ),
+    annotations=ToolAnnotations(
+        title="Qwen3-8B Inference",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+async def mcp_inference(
+    ctx: Context,
+    prompt: str = "",
+    messages: list = None,
+    max_tokens: int = 256,
+    temperature: float = 0.7,
+) -> CallToolResult:
     meta = None
     try:
         meta = ctx.request_context.meta
@@ -427,16 +455,80 @@ async def mcp_inference(ctx: Context, prompt: str = "", messages: list = None, m
     )
 
 
-@mcp.tool(name="health", description="Free health check.")
+@mcp.tool(
+    name="health",
+    title="Health Check",
+    description=(
+        "Free health check for the x402 exchange. Returns the current model, "
+        "network, exchange endpoint URL, and live on-chain USDC balance. "
+        "No payment required."
+    ),
+    annotations=ToolAnnotations(
+        title="Health Check",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 async def mcp_health() -> str:
     atomic, human = get_usdc_balance()
     return json.dumps({"status": "ok", "model": "Qwen/Qwen3-8B", "usdc_balance": human, "network": NETWORK})
 
 
-@mcp.tool(name="status", description="Free P&L report.")
+@mcp.tool(
+    name="status",
+    title="Entity P&L Report",
+    description=(
+        "Free real-time profit-and-loss report for the x402 exchange entity. "
+        "Returns on-chain USDC balance (revenue), model details, and network info. "
+        "Use this to check the entity's financial health before interacting. "
+        "No payment required."
+    ),
+    annotations=ToolAnnotations(
+        title="Entity P&L Report",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
 async def mcp_status() -> str:
     atomic, human = get_usdc_balance()
     return json.dumps({"entity": "x402-exchange", "model": "Qwen/Qwen3-8B", "usdc_balance": human, "usdc_atomic": atomic, "network": NETWORK})
+
+
+# ── Prompts (for Smithery quality score + user guidance) ──────────────────
+
+@mcp.prompt(
+    name="ask",
+    title="Ask x402-exchange",
+    description="Send a question to Qwen3-8B via the x402 exchange. Costs $0.01 USDC.",
+)
+def ask_prompt(question: str) -> list:
+    return [{"role": "user", "content": f"Use the inference tool to ask: {question}"}]
+
+
+@mcp.prompt(
+    name="check_balance",
+    title="Check Entity Balance",
+    description="Check the x402 exchange entity's current USDC balance and P&L status.",
+)
+def check_balance_prompt() -> list:
+    return [{"role": "user", "content": "Use the status tool to check the entity's financial health."}]
+
+
+@mcp.prompt(
+    name="how_to_pay",
+    title="How to Pay",
+    description="Learn how to make x402 USDC payments to use paid tools.",
+)
+def how_to_pay_prompt() -> list:
+    return [{"role": "user", "content": (
+        "Explain how to pay for tools on the x402 exchange. "
+        "Call the inference tool without payment first to see the PaymentRequired "
+        "response, then explain the EIP-3009 signing flow."
+    )}]
 
 
 # Get MCP Starlette app
