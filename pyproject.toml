@@ -1,0 +1,23 @@
+[project]
+name = "x402-mvp"
+version = "0.1.0"
+description = "x402 payment protocol MVP -- accept your first dollar via HTTP or MCP"
+requires-python = ">=3.12"
+dependencies = [
+    "x402[fastapi,httpx,evm]",
+    "uvicorn",
+    "python-dotenv",
+    "eth-account",
+    "mcp[cli]",
+    "structlog",
+    "cdp-sdk",
+    "web3",
+    "httpx",
+]
+
+[project.scripts]
+seller = "seller:main"
+buyer = "buyer:main"
+mcp-server = "mcp_server:main"
+mcp-buyer = "mcp_buyer:main"
+bootstrap = "bootstrap:main"
