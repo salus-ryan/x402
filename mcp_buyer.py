@@ -114,6 +114,64 @@ async def buy_via_mcp():
             print(f"    transaction: {receipt.get('transaction')}")
             print(f"    network:     {receipt.get('network')}")
 
+        # Step 7: Call inference (paid) -- the exchange's brain
+        tool_name = sys.argv[1] if len(sys.argv) > 1 else "ping"
+        if tool_name == "inference" or "--inference" in sys.argv:
+            print()
+            print("=" * 60)
+            print("  INFERENCE (paid Qwen3-8B via x402)")
+            print("=" * 60)
+
+            # Call without payment to get requirements
+            print("--- Calling inference (no payment) ---")
+            inf_result = await client.call_tool("inference", arguments={"prompt": "What are you?"})
+
+            inf_pr_data = None
+            if inf_result.structured_content:
+                sc = inf_result.structured_content
+                if isinstance(sc, dict) and "x402Version" in sc:
+                    inf_pr_data = sc
+            if inf_pr_data is None and inf_result.content:
+                try:
+                    parsed = json.loads(inf_result.content[0].text)
+                    if "x402Version" in parsed:
+                        inf_pr_data = parsed
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+            if inf_pr_data is None:
+                print("  ERROR: Could not get PaymentRequired for inference")
+                return
+
+            print(f"  Payment required: {inf_pr_data['accepts'][0]['amount']} atomic USDC")
+
+            # Sign payment
+            print("--- Signing payment for inference ---")
+            inf_payment_required = parse_payment_required(inf_pr_data)
+            inf_payload = await x402_client.create_payment_payload(inf_payment_required)
+            inf_payload_dict = inf_payload.model_dump(by_alias=True, exclude_none=True)
+
+            # Retry with payment + prompt
+            print("--- Calling inference with payment ---")
+            inf_paid = await client.call_tool(
+                "inference",
+                arguments={
+                    "prompt": "What are you? Respond in exactly 2 sentences.",
+                    "max_tokens": 256,
+                },
+                meta={"x402/payment": inf_payload_dict},
+            )
+
+            print(f"  isError: {inf_paid.is_error}")
+            if inf_paid.content:
+                result_data = json.loads(inf_paid.content[0].text)
+                print(f"  Model:    {result_data.get('model')}")
+                print(f"  Response: {result_data.get('response')}")
+                print(f"  Usage:    {result_data.get('usage')}")
+                print(f"  Paid:     {result_data.get('amount')}")
+                if result_data.get("settlement_tx"):
+                    print(f"  Tx:       {result_data['settlement_tx']}")
+
 
 def main():
     asyncio.run(buy_via_mcp())

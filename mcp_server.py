@@ -5,6 +5,9 @@ Implements the x402 MCP transport spec:
 
 Any MCP client (Claude Desktop, Devin, cursor, etc.) can discover tools,
 see payment requirements, sign a payment, and call the tool.
+
+The `inference` tool routes to Qwen3-8B hosted on Modal -- agents pay USDC
+for inference. Revenue funds compute for self-improvement.
 """
 import asyncio
 import json
@@ -15,6 +18,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 import structlog
 from dotenv import load_dotenv
 from mcp.server.mcpserver import Context, MCPServer
@@ -40,6 +44,10 @@ log = structlog.get_logger()
 SELLER_ADDRESS = os.environ["SELLER_ADDRESS"]
 FACILITATOR_URL = os.environ.get("FACILITATOR_URL", "https://x402.org/facilitator")
 NETWORK: Network = os.environ.get("NETWORK", "eip155:84532")
+EXCHANGE_URL = os.environ.get(
+    "EXCHANGE_URL",
+    "https://salus--x402-exchange-exchange.us-east.modal.direct",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +125,11 @@ async def lifespan(server: MCPServer) -> AsyncIterator[AppState]:
             price="$0.01",
             description="A paid ping -- proof of life for x402 payments. Costs $0.01 USDC.",
             resource_url="mcp://tool/ping",
+        ),
+        "inference": ToolPaymentConfig(
+            price="$0.01",
+            description="Qwen3-8B inference via x402 exchange. Costs $0.01 USDC per request.",
+            resource_url="mcp://tool/inference",
         ),
     }
 
@@ -251,6 +264,110 @@ async def ping(ctx: Context) -> CallToolResult:
 
 
 @mcp.tool(
+    name="inference",
+    description=(
+        "Qwen3-8B inference -- the x402 exchange's brain. "
+        "Costs $0.01 USDC per request on Base Sepolia. "
+        "Provide a 'prompt' argument (or 'messages' as OpenAI chat format). "
+        "Call without payment to see PaymentRequired details. "
+        "Retry with _meta['x402/payment'] containing your signed PaymentPayload."
+    ),
+)
+async def inference(
+    ctx: Context,
+    prompt: str = "",
+    messages: list[dict[str, str]] | None = None,
+    max_tokens: int = 256,
+    temperature: float = 0.7,
+) -> CallToolResult:
+    state: AppState = ctx.request_context.lifespan_context
+    tool_name = "inference"
+    payment_data = extract_payment_from_meta(ctx)
+
+    if payment_data is None:
+        log.info("inference called without payment, returning 402")
+        return build_payment_required_result(
+            state.payment_required_cache[tool_name]
+        )
+
+    # Payment provided -- verify and settle
+    log.info("inference called with payment, verifying")
+    try:
+        payload = parse_payment_payload(payment_data)
+        reqs = state.requirements_cache[tool_name]
+
+        matched_req = None
+        for req in reqs:
+            if req.scheme == payload.accepted.scheme and req.network == payload.accepted.network:
+                matched_req = req
+                break
+
+        if matched_req is None:
+            return build_payment_required_result(state.payment_required_cache[tool_name])
+
+        verify_result = await state.x402_server.verify_payment(payload, matched_req)
+        if not verify_result.is_valid:
+            pr = state.payment_required_cache[tool_name].copy()
+            pr["error"] = f"Payment verification failed: {verify_result.invalid_reason}"
+            return build_payment_required_result(pr)
+
+        settle_result = await state.x402_server.settle_payment(payload, matched_req)
+        settlement_response = settle_result.model_dump(by_alias=True, exclude_none=True)
+
+        if not settle_result.success:
+            pr = state.payment_required_cache[tool_name].copy()
+            pr["error"] = f"Settlement failed: {settle_result.error_reason}"
+            return build_payment_required_result(pr)
+
+        log.info("payment settled, calling exchange", tx=settle_result.transaction)
+
+        # Build messages for the exchange
+        if messages is None:
+            messages = []
+        if prompt:
+            messages.append({"role": "user", "content": prompt})
+        if not messages:
+            messages = [{"role": "user", "content": "Hello"}]
+
+        # Call the Modal-hosted Qwen3-8B
+        async with httpx.AsyncClient(timeout=120) as client:
+            resp = await client.post(
+                f"{EXCHANGE_URL}/v1/chat/completions",
+                json={
+                    "model": "Qwen/Qwen3-8B",
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+            )
+            resp.raise_for_status()
+            exchange_result = resp.json()
+
+        content = exchange_result["choices"][0]["message"]["content"]
+        usage = exchange_result.get("usage", {})
+
+        result = {
+            "response": content,
+            "model": "Qwen/Qwen3-8B",
+            "usage": usage,
+            "paid": True,
+            "amount": "$0.01",
+            "settlement_tx": settle_result.transaction,
+        }
+
+        return build_success_result(
+            content=json.dumps(result),
+            settlement_response=settlement_response,
+        )
+
+    except Exception as e:
+        log.error("inference error", error=str(e))
+        pr = state.payment_required_cache[tool_name].copy()
+        pr["error"] = f"Error: {e}"
+        return build_payment_required_result(pr)
+
+
+@mcp.tool(
     name="health",
     description="Free health check -- no payment required.",
 )
@@ -261,6 +378,8 @@ async def health() -> str:
         "network": NETWORK,
         "protocol": "x402",
         "transport": "mcp",
+        "exchange": EXCHANGE_URL,
+        "model": "Qwen/Qwen3-8B",
     })
 
 
