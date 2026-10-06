@@ -24,6 +24,16 @@ from dotenv import load_dotenv
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import CallToolResult, TextContent
 
+from ledger import (
+    Ledger,
+    load_ledger,
+    save_ledger,
+    record_payment,
+    get_usdc_balance,
+    get_modal_spend,
+    FINETUNE_COST_ESTIMATE_USD,
+)
+
 from x402 import (
     PaymentPayload,
     PaymentRequired,
@@ -110,6 +120,7 @@ class AppState:
     tool_configs: dict[str, ToolPaymentConfig]
     requirements_cache: dict[str, list[PaymentRequirements]]
     payment_required_cache: dict[str, dict[str, Any]]
+    ledger: Ledger
 
 
 @asynccontextmanager
@@ -159,11 +170,14 @@ async def lifespan(server: MCPServer) -> AsyncIterator[AppState]:
         )
         payment_required_cache[tool_name] = pr.model_dump(by_alias=True, exclude_none=True)
 
+    ledger = load_ledger()
+
     log.info(
         "x402 MCP server initialized",
         seller=SELLER_ADDRESS,
         network=NETWORK,
         tools=list(tool_configs.keys()),
+        ledger_entries=len(ledger.entries),
     )
 
     yield AppState(
@@ -171,6 +185,7 @@ async def lifespan(server: MCPServer) -> AsyncIterator[AppState]:
         tool_configs=tool_configs,
         requirements_cache=requirements_cache,
         payment_required_cache=payment_required_cache,
+        ledger=ledger,
     )
 
 
@@ -251,6 +266,8 @@ async def ping(ctx: Context) -> CallToolResult:
             return build_payment_required_result(pr)
 
         log.info("payment settled", tx=settle_result.transaction)
+        record_payment(state.ledger, 0.01, settle_result.transaction or "", {"tool": "ping"})
+        save_ledger(state.ledger)
         return build_success_result(
             content=json.dumps({"message": "pong", "paid": True, "amount": "$0.01"}),
             settlement_response=settlement_response,
@@ -346,6 +363,12 @@ async def inference(
         content = exchange_result["choices"][0]["message"]["content"]
         usage = exchange_result.get("usage", {})
 
+        record_payment(
+            state.ledger, 0.01, settle_result.transaction or "",
+            {"tool": "inference", "usage": usage},
+        )
+        save_ledger(state.ledger)
+
         result = {
             "response": content,
             "model": "Qwen/Qwen3-8B",
@@ -380,6 +403,120 @@ async def health() -> str:
         "transport": "mcp",
         "exchange": EXCHANGE_URL,
         "model": "Qwen/Qwen3-8B",
+    })
+
+
+@mcp.tool(
+    name="status",
+    description=(
+        "Free P&L report -- the entity's self-awareness. "
+        "Returns on-chain USDC balance (revenue), Modal compute spend (cost), "
+        "net position, and whether the entity can afford to self-improve."
+    ),
+)
+async def status(ctx: Context) -> str:
+    state: AppState = ctx.request_context.lifespan_context
+    ledger = state.ledger
+
+    balance_atomic, balance_human = get_usdc_balance()
+
+    modal_spend = 0.0
+    modal_period = "unavailable"
+    try:
+        modal_spend, modal_period = get_modal_spend()
+    except Exception:
+        pass
+
+    payment_count = len(
+        [e for e in ledger.entries if e.event == "payment_received"]
+    )
+
+    return json.dumps({
+        "entity": "x402-exchange",
+        "model": "Qwen/Qwen3-8B",
+        "gpu": "L4",
+        "revenue": {
+            "usdc_balance": balance_human,
+            "usdc_atomic": balance_atomic,
+            "payments_logged": payment_count,
+            "total_logged_usdc": ledger.total_revenue_usdc,
+        },
+        "costs": {
+            "modal_spend_usd": modal_spend,
+            "period": modal_period,
+            "total_logged_usd": ledger.total_spend_usd,
+        },
+        "net_position_usd": balance_human - modal_spend,
+        "self_improvement": {
+            "can_afford_finetune": balance_human >= FINETUNE_COST_ESTIMATE_USD,
+            "finetune_cost_estimate_usd": FINETUNE_COST_ESTIMATE_USD,
+            "finetunes_completed": ledger.finetune_count,
+        },
+    })
+
+
+@mcp.tool(
+    name="self_improve",
+    description=(
+        "Trigger the entity's self-improvement loop. Free to call. "
+        "Checks if the entity has enough USDC revenue to fund a LoRA "
+        "fine-tuning run (~$2.20 on A10G). If affordable, prepares "
+        "training data from successful interactions and launches "
+        "fine-tuning on Modal. Returns status regardless."
+    ),
+)
+async def self_improve(ctx: Context, force: bool = False) -> str:
+    state: AppState = ctx.request_context.lifespan_context
+    ledger = state.ledger
+
+    balance_atomic, balance_human = get_usdc_balance()
+    can_afford = balance_human >= FINETUNE_COST_ESTIMATE_USD
+
+    if not can_afford and not force:
+        shortfall = FINETUNE_COST_ESTIMATE_USD - balance_human
+        return json.dumps({
+            "status": "insufficient_funds",
+            "usdc_balance": balance_human,
+            "finetune_cost_estimate": FINETUNE_COST_ESTIMATE_USD,
+            "shortfall": shortfall,
+            "payments_needed": int(shortfall / 0.01) + 1,
+            "message": (
+                f"Need ${shortfall:.2f} more USDC to fund fine-tuning. "
+                f"That's about {int(shortfall / 0.01) + 1} more paid requests."
+            ),
+        })
+
+    # Affordable (or forced) -- trigger fine-tuning
+    from finetune import prepare_training_data, save_training_data, TRAINING_DATA_PATH
+    import modal as modal_sdk
+
+    examples = prepare_training_data(ledger)
+    count = save_training_data(examples)
+
+    # Upload to Modal volume
+    training_vol_ref = modal_sdk.Volume.from_name(
+        "x402-training-data", create_if_missing=True
+    )
+    with open(TRAINING_DATA_PATH, "rb") as f:
+        training_vol_ref.write_file("training_data.jsonl", f)
+
+    record_finetune(ledger, "finetune_started", details={
+        "samples": count,
+        "triggered_by": "self_improve_tool",
+        "balance_at_trigger": balance_human,
+    })
+    save_ledger(ledger)
+
+    return json.dumps({
+        "status": "finetune_queued",
+        "training_samples": count,
+        "usdc_balance": balance_human,
+        "estimated_cost": FINETUNE_COST_ESTIMATE_USD,
+        "message": (
+            f"Prepared {count} training examples and uploaded to Modal. "
+            f"Run 'modal run finetune.py' to execute. "
+            f"After completion, restart the exchange to load the new adapter."
+        ),
     })
 
 

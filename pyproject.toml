@@ -1,7 +1,7 @@
 [project]
-name = "x402-mvp"
-version = "0.1.0"
-description = "x402 payment protocol MVP -- accept your first dollar via HTTP or MCP"
+name = "x402-exchange"
+version = "0.2.0"
+description = "Autonomous x402 exchange -- Qwen3-8B on Modal, paid via USDC, self-improving"
 requires-python = ">=3.12"
 dependencies = [
     "x402[fastapi,httpx,evm]",
@@ -13,6 +13,8 @@ dependencies = [
     "cdp-sdk",
     "web3",
     "httpx",
+    "pydantic>=2.0",
+    "modal",
 ]
 
 [project.scripts]
@@ -21,3 +23,5 @@ buyer = "buyer:main"
 mcp-server = "mcp_server:main"
 mcp-buyer = "mcp_buyer:main"
 bootstrap = "bootstrap:main"
+ledger = "ledger:main"
+finetune = "finetune:main"
