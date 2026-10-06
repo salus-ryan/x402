@@ -37,21 +37,45 @@ MCP_URL = f"{GATEWAY}/mcp"
 
 
 async def call_mcp(session_id: str | None, method: str, params: dict, client: httpx.AsyncClient):
-    """Send a JSON-RPC request to the MCP endpoint."""
+    """Send a JSON-RPC request to the MCP endpoint with retry for cold starts."""
     headers = {"Content-Type": "application/json"}
     if session_id:
         headers["Mcp-Session-Id"] = session_id
 
     body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    resp = await client.post(MCP_URL, json=body, headers=headers, timeout=120)
 
-    # Parse SSE response
-    sid = resp.headers.get("Mcp-Session-Id", session_id)
-    text = resp.text
-    for line in text.splitlines():
-        if line.startswith("data: "):
-            return sid, json.loads(line[6:])
-    return sid, None
+    for attempt in range(5):
+        try:
+            resp = await client.post(MCP_URL, json=body, headers=headers, timeout=120)
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError):
+            if attempt < 4:
+                wait = 10 * (attempt + 1)
+                print(f"  Gateway not ready, retrying in {wait}s...")
+                await asyncio.sleep(wait)
+                continue
+            raise
+
+        sid = resp.headers.get("Mcp-Session-Id", session_id)
+        text = resp.text
+
+        # Parse SSE response
+        for line in text.splitlines():
+            if line.startswith("data: "):
+                return sid, json.loads(line[6:])
+
+        # No data -- gateway may be cold-starting
+        if attempt < 4:
+            wait = 10 * (attempt + 1)
+            print(f"  No response (gateway cold-starting), retrying in {wait}s...")
+            await asyncio.sleep(wait)
+            # Reset session for fresh init
+            if method == "initialize":
+                session_id = None
+                headers.pop("Mcp-Session-Id", None)
+        else:
+            return sid, None
+
+    return session_id, None
 
 
 async def ask(prompt: str):
